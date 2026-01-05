@@ -1,0 +1,185 @@
+plant:
+  id: "plant-01"
+  name: "TCC – Sistema de Tanque Aquecido"
+
+simulation:
+  dt_seconds: 1
+  duration_seconds: 600
+
+equipment:
+  tanks:
+    - id: tk-01
+      tag: TK-01
+      capacity_l: 1000
+      initial_volume_l: 200
+      initial_temp_c: 25
+
+  valves:
+    - id: xv-01
+      tag: XV-01
+      service: product
+      initial_open: false
+
+    - id: xv-02
+      tag: XV-02
+      service: cip
+      initial_open: false
+
+    - id: xv-03
+      tag: XV-03
+      service: product
+      initial_open: false
+
+    - id: xv-04
+      tag: XV-04
+      service: clean_air
+      initial_open: false
+
+    - id: xv-05
+      tag: XV-05
+      service: vent
+      initial_open: true
+
+    - id: xv-06
+      tag: XV-06
+      service: steam
+      initial_open: false
+
+    - id: xv-07
+      tag: XV-07
+      service: transfer
+      initial_open: false
+
+  motors:
+    - id: m-agit-01
+      tag: AG-01
+      initial_state: stopped
+      has_reverse: true
+
+    - id: mt-01
+      tag: MT-01
+      initial_state: stopped
+      has_reverse: false
+
+  sensors:
+    - id: tit-01
+      tag: TIT-01
+      kind: temp_product
+      source: tank.tk-01.temp
+      deadband: 0.5
+      alarms: { ll: 10, l: 20, h: 80, hh: 90 }
+
+    - id: tit-02
+      tag: TIT-02
+      kind: temp_steam
+      source: tank.tk-01.steam_temp
+      deadband: 1.0
+      alarms: { h: 160, hh: 175 }
+
+    - id: lit-01
+      tag: LIT-01
+      kind: level_pct
+      source: tank.tk-01.level_pct
+      deadband: 0.2
+      alarms: { ll: 5, l: 10, h: 90, hh: 95 }
+
+    - id: pit-01
+      tag: PIT-01
+      kind: pressure
+      source: tank.tk-01.pressure_bar
+      deadband: 0.05
+      alarms: { h: 1.5, hh: 1.8 }
+
+connections:
+  # Produto 1 entra no tanque pelo inlet A
+  - id: prod-1-to-tk01
+    type: product_inlet
+    source:
+      product_name: product-1
+      flow_lpm: 30
+      temp_c: 25
+    path: [xv-01]
+    target:
+      equipment_id: tk-01
+      port: inlet_A
+
+  # Produto 2 entra no tanque pelo inlet B
+  - id: prod-2-to-tk01
+    type: product_inlet
+    source:
+      product_name: product-2
+      flow_lpm: 30
+      temp_c: 15
+    path: [xv-03]
+    target:
+      equipment_id: tk-01
+      port: inlet_B
+
+  # CIP entra no tanque (entrada de limpeza) via XV-02
+  - id: cip-to-tk01
+    type: cip_inlet
+    source:
+      flow_lpm: 25
+      temp_c: 70
+      chemical: "detergent"   # opcional (pode remover)
+    path: [xv-02]
+    target:
+      equipment_id: tk-01
+      port: cip_inlet
+
+  # Ar limpo (pressurização/blanketing/ventilação filtrada) via XV-04
+  - id: clean-air-to-tk01
+    type: clean_air_inlet
+    source:
+      flow_nlpm: 120           # normal L/min (opcional)
+      pressure_bar: 1.2        # opcional
+      temp_c: 25               # opcional
+    path: [xv-04]
+    target:
+      equipment_id: tk-01
+      port: headspace
+
+  # Vapor na camisa do tanque (jacket) via XV-06
+  - id: steam-to-jacket-tk01
+    type: steam_jacket
+    source:
+      temp_c: 140
+    path: [xv-06]
+    target:
+      equipment_id: tk-01
+      port: jacket
+
+  # Linha de transferência: sai do tanque via XV-07 e passa pela bomba MT-01
+  - id: transfer-from-tk01
+    type: transfer_outlet
+    source:
+      from_tank_id: tk-01
+      nominal_flow_lpm: 40     # vazão nominal de transferência (placeholder)
+    path: [xv-07, mt-01]       # ordem explícita: valve -> bomba
+    target:
+      equipment_id: tk-01
+      port: outlet
+
+  # Agitação (link mecânico)
+  - id: agitator-tk01
+    type: agitation_link
+    source:
+      motor_id: m-agit-01
+      requires_volume_gt_l: 10
+    target:
+      equipment_id: tk-01
+      port: agitator
+
+  # Saída de ar limpo pelo vent (alívio de pressão) via XV-05
+  - id: vent-from-tk01
+    type: vent_outlet
+    source:
+      from_tank_id: tk-01
+      mode: pressure_relief          # opcional: documentação da intenção
+      target_pressure_bar: 1.1       # opcional: setpoint do alívio (se você quiser no futuro)
+    path: [xv-05]                    # ordem explícita
+    target:
+      equipment_id: tk-01
+      port: headspace                # de onde sai
+    discharge:
+      to: atmosphere                 # para onde vai (ambiente)

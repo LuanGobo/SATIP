@@ -9,7 +9,8 @@ type Tank struct {
 	tag string
 
 	tempC float64
-
+	pressureBar float64
+	
 	//capacidade do tanque
 	capacityL 	float64
 	volumeL 	float64
@@ -17,6 +18,11 @@ type Tank struct {
 	//Entradas no tanque
 	inflowLpm 	float64 // L/min
 	inFlowTempC 	float64 // temperatudo do produto de entrada °C
+
+	
+	headspaceVolumeL float64
+	cleanAirFlowNlpm float64 // entrada de ar limpo
+	ventOpen         bool    // se o vent está aberto
 	
 	//Agitação Ligada
 	agitationON bool
@@ -29,6 +35,8 @@ type Tank struct {
 	uaWPerk			float64	// W/K (força de troca térmica)
 	cpJPerkgk		float64	// J/kg·K
 	densitykgPerL	float64	// kg/L (aprox água ~1.0)
+	gasGainCoeff     float64 // ganho de pressão por Nl/min
+    ventReliefCoeff  float64 // eficiência do vent
 }
 
 func Newtank(
@@ -51,12 +59,15 @@ func Newtank(
 		capacityL: 	capacityL,
 		volumeL: 	volumeL,
 		tempC: 		initialTempC,
+		pressureBar: 1.0,
 
 		//Setpoints razóaveis para o simulador
 		inFlowTempC: 	initialTempC,
 		uaWPerk:		900.0,   // valor placeholder: ajuste/calibre depois
 		cpJPerKgK:   	4180.0,  // água ~4180 J/kgK
 		densityKgPerL: 	1.0,   // água ~1.0 kg/L
+		gasGainCoeff: 0.002,
+		ventReliefCoeff: 1.5,
 	}
 
 	return t, nil
@@ -69,6 +80,7 @@ func (t *Tank) Kind() string {return "tank"}
 func (t *Tank) CapacityL() float64 {return t.capacityL}
 func (t *Tank) VolumeL() float64 {return t.volumeL}
 func (t *Tank) TempC() float64 {return t.tempC}
+func (t *Tank) PressureBar() float64 {return t.pressureBar}
 
 func (t *Tank) LevelPct() float64 {
 	if t.capacityL == 0{
@@ -105,6 +117,17 @@ func (t *Tank) SetThermalParams(uaWPerk, cpJPerKgK, densityKgPerL float64) {
 	if densityKgPerL > 0 {
 		t.densityKgPerL = densityKgPerL
 	}
+}
+
+func (t *Tank) SetCleanAirInflow(flowNlpm float64) {
+    if flowNlpm < 0 {
+        flowNlpm = 0
+    }
+    t.cleanAirFlowNlpm = flowNlpm
+}
+
+func (t *Tank) SetVentOpen(open bool) {
+    t.ventOpen = open
 }
 
 func (t *Tank) Tick(dtSeconds float64) {
@@ -152,5 +175,21 @@ func (t *Tank) Tick(dtSeconds float64) {
 		k := uaEff / (massKg * t.cpJPerKgK)
 		t.tempC = tempC + (k + (t.steamTempC - t.tempC) * dtSeconds)
 	}
-	
+
+	// Pressão
+	headspaceL := t.capacityL - t.volumeL
+	if headspaceL < 1 {
+		headspaceL = 1 // evita instabilidade numérica
+	}
+
+	// ganho por entrada de ar
+	pressGain := (t.cleanAirFlowNlpm / headspaceL) * t.gasGainCoeff
+
+	// alívio pelo vent
+	pressRelief := 0.0
+	if t.ventOpen {
+		pressRelief = (t.pressureBar - 1.0) * t.ventReliefCoeff
+	}
+
+	t.pressureBar += (pressGain - pressRelief) * dtSeconds
 }
