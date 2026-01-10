@@ -1,184 +1,130 @@
 package domain
 
-import (
-	"fmt"
-)
+import "fmt"
 
-type AlarmLevel int
-
-const (
-	AlarmNone AlarmLevel = iota
-	AlarmLL
-	AlarmL
-	AlarmH
-	AlarmHH
-)
-
-func (a AlarmLevel) String() string{
-	switch a{
-	case AlarmLL:
-		return "LL"
-	case AlarmL:
-		return "L"
-	case AlarmH:
-		return "H"
-	case AlarmHH:
-		return "HH"
-	case AlarmNone:
-		return "NONE"
-	default:
-		return "unknown"
-	}
-}
-
-type AnalogSource interface{
+type AnalogSource interface {
 	Read() float64
 }
 
 type Event struct {
-	SourceID 	string
-	SourceTag 	string
-	EventType 	string
-	AlarmLevel 	AlarmLevel
-	Value 		float64
-	Message 	string
+	Tag     string
+	Kind    string
+	Value   float64
+	TimeSec float64
 }
 
 type AnalogSensor struct {
-	id 			string
-	tag 		string
-	kind 		string
+	id   string
+	tag  string
+	kind string
 
-	source 		AnalogSource
+	source   AnalogSource
+	deadband float64
 
-	enabledLL	bool
-	enabledL	bool
-	enabledH	bool
-	enabledHH	bool
+	initialized bool
+	value       float64
+	lastValue   float64
+	timeSec     float64
 
-	limitLL		float64
-	limitL		float64
-	limitH		float64
-	limitHH		float64
-
-	deadband	float64
-
-	lastValue	float64
-	alarmLevel 	AlarmLevel
+	enLL, enL, enH, enHH bool
+	ll, l, h, hh         float64
 }
 
-func NewAnalogSensor(id, tag, kind string, source, AnalogSource, deadband float64) (*AnalogSensor, error) {
+func NewAnalogSensor(
+	id, tag, kind string,
+	source AnalogSource,
+	deadband float64,
+) (*AnalogSensor, error) {
+
 	if id == "" {
 		return nil, fmt.Errorf("sensor: id is required")
 	}
+	if tag == "" {
+		return nil, fmt.Errorf("sensor: tag is required")
+	}
+	if kind == "" {
+		return nil, fmt.Errorf("sensor: kind is required")
+	}
 	if source == nil {
-		return nil, fmt.Errorf("sensor: source is required")	
+		return nil, fmt.Errorf("sensor: source is required")
 	}
 	if deadband < 0 {
-		deadband = 0
+		return nil, fmt.Errorf("sensor: deadband must be >= 0")
 	}
 
-	s := &AnalogSensor{
-		id:	id,
-		tag:	tag,
-		kind: kind,
-		source: source,
-		deadband:deadband,
-		alarmLevel:	AlarmNone
-	}
-	s.lastValue = source.Read()
-	return s,nil
+	return &AnalogSensor{
+		id:       id,
+		tag:      tag,
+		kind:     kind,
+		source:   source,
+		deadband: deadband,
+	}, nil
 }
 
-func (s *AnalogSensor) ID() string {return s.id}
-func (s *AnalogSensor) Tag() string {return s.tag}
-func (s *AnalogSensor) Kind() string {return s.kind}
-func (s *AnalogSensor) Value() float64 {return s.lastValue}
-func (s *AnalogSensor) AlarmLevel() AlarmLevel {return s.alarmLevel}
-
-func (s *AnalogSensor) ConfigureAlarms(	
-	enabledLL bool, limitLL float64,
-	enabledL bool, 	limitL float64,
-	enabledH bool, 	limitH float64,
-	enabledHH bool, limitHH float64,
-	) {
-		s.enabledLL, s.limitLL = enabledLL, limitLL
-		s.enabledL, s.limitLL = enabledL, limitLL
-		s.enabledH, s.limitLL = enabledH, limitLL
-		s.enabledHH, s.limitLL = enabledHH, limitLL
+func (s *AnalogSensor) ConfigureAlarms(
+	enLL bool, ll float64,
+	enL bool, l float64,
+	enH bool, h float64,
+	enHH bool, hh float64,
+) {
+	s.enLL, s.ll = enLL, ll
+	s.enL, s.l = enL, l
+	s.enH, s.h = enH, h
+	s.enHH, s.hh = enHH, hh
 }
 
-func (s *AnalogSensor) Tick(dtSeconds float64) (events []Event) {
-	_ = dtSeconds
+func (s *AnalogSensor) Tick(dtSeconds float64) []Event {
+	s.timeSec += dtSeconds
 
-	val := s.source.Read()
-	s.lastValue = val
+	raw := s.source.Read()
 
-	newLevel = s.evalAlarm(val)
-
-	if s.alarmLevel != s.alarmLevel {
-		if s.alarmLevel != AlarmNone {
-			events = append(events, Event{
-				SourceID:   s.id,
-				SourceTag:  s.tag,
-				EventType:  "ALARM_EXIT",
-				AlarmLevel: s.alarmLevel,
-				Value:      val,
-				Message:    "alarm exited",
-			})
-		}
-		if newLevel != AlarmNone{
-			events = append(events, Event{
-				SourceID:   s.id,
-				SourceTag:  s.tag,
-				EventType:  "ALARM_ENTER",
-				AlarmLevel: s.alarmLevel,
-				Value:      val,
-				Message:    "alarm entered",
-			})
-		}
-
-		s.alarmLevel = newLevel
+	if !s.initialized {
+		s.initialized = true
+		s.value = raw
+		s.lastValue = raw
+		return nil
 	}
+
+	if abs(raw-s.value) >= s.deadband {
+		s.lastValue = s.value
+		s.value = raw
+	}
+
+	return s.evalAlarms()
+}
+
+func (s *AnalogSensor) evalAlarms() []Event {
+	var events []Event
+	v := s.value
+
+	if s.enLL && v <= s.ll {
+		events = append(events, s.makeEvent("alarm_ll", v))
+	}
+	if s.enL && v <= s.l {
+		events = append(events, s.makeEvent("alarm_l", v))
+	}
+	if s.enH && v >= s.h {
+		events = append(events, s.makeEvent("alarm_h", v))
+	}
+	if s.enHH && v >= s.hh {
+		events = append(events, s.makeEvent("alarm_hh", v))
+	}
+
 	return events
 }
 
-func (s *AnalogSensor) evalAlarm(val float64) AlarmLevel {
-	switch s.alarmLevel{
-	case AlarmHH:
-		if!(s.enabledHH && val > s.limitHH-s.deadband){
-			break
-		}
-		return AlarmHH
-	case AlarmH:
-		if!(s.enabledH && val > s.limitH-s.deadband){
-			break
-		}
-		return AlarmH
-	case AlarmL:
-		if!(s.enabledL && val > s.limitL+s.deadband){
-			break
-		}
-		return AlarmL
-	case AlarmLL:
-		if!(s.enabledLL && val > s.limitLL+s.deadband){
-			break
-		}
-		return AlarmLL
+func (s *AnalogSensor) makeEvent(kind string, v float64) Event {
+	return Event{
+		Tag:     s.tag,
+		Kind:    kind,
+		Value:   v,
+		TimeSec: s.timeSec,
 	}
-
-	if s.enabledHH && val >= s.limitHH {
-		return AlarmHH
-	}
-	if s.enabledH && val >= s.limitH {
-		return AlarmH
-	}
-	if s.enabledL && val >= s.limitL {
-		return AlarmL
-	}
-	if s.enabledLL && val >= s.limitLL {
-		return AlarmLL
-	}
-	return AlarmNone
 }
 
+func abs(x float64) float64 {
+	if x < 0 {
+		return -x
+	}
+	return x
+}

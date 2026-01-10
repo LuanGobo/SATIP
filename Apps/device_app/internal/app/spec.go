@@ -185,7 +185,7 @@ func (s *PlantSpec) Validate() error{
 		if c.Type == "" {
 			return fmt.Errorf("spec: connections[%d].type is required", i)
 		}
-		if len(c.Path) == 0 {
+		if len(c.Path) == 0 && c.Type != "agitation_link" {
 			return fmt.Errorf("spec: connections[%d].path must have at least 1 element", i)
 		}
 		if c.Target.EquipmentID == "" {

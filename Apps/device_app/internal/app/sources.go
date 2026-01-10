@@ -7,40 +7,46 @@ import (
 	"device_app/internal/domain"
 )
 
-func ResolveAnalogSource(m *Model, src string) (domain.AnalogSource, error) {
-	parts := strings.Split(src, ".")
+type analogSourceFunc func() float64
+
+func (f analogSourceFunc) Read() float64 { return f() }
+
+// ResolveAnalogSource aceita strings como:
+//   tank.tk-01.temp
+//   tank.tk-01.level_pct
+//   tank.tk-01.pressure_bar
+//   tank.tk-01.steam_temp
+func ResolveAnalogSource(m *Model, expr string) (domain.AnalogSource, error) {
+	parts := strings.Split(strings.TrimSpace(expr), ".")
 	if len(parts) != 3 {
-		return nil, fmt.Errorf("invalid source '%s' (expected tank.<id>.<field>)", src)
+		return nil, fmt.Errorf("source: invalid format '%s' (expected 'tank.<id>.<field>')", expr)
 	}
 
-	if parts[0] != "tank" {
-		return nil, fmt.Errorf("unsupported source kind '%s'", parts[0])
-	}
+	kind := parts[0]
+	id := parts[1]
+	field := parts[2]
 
-	tk, ok := m.Tanks[parts[1]]
-	if !ok {
-		return nil, fmt.Errorf("tank '%s' not found", parts[1])
-	}
+	switch kind {
+	case "tank":
+		tk := m.Tanks[id]
+		if tk == nil {
+			return nil, fmt.Errorf("source: tank '%s' not found", id)
+		}
 
-	switch parts[2] {
-	case "temp":
-		return TankTempSource{tk}, nil
-	case "level_pct":
-		return TankLevelPctSource{tk}, nil
-	case "pressure_bar":
-		return TankPressureSource{tk}, nil
+		switch field {
+		case "temp":
+			return analogSourceFunc(func() float64 { return tk.TempC() }), nil
+		case "level_pct":
+			return analogSourceFunc(func() float64 { return tk.LevelPct() }), nil
+		case "pressure_bar":
+			return analogSourceFunc(func() float64 { return tk.PressureBar() }), nil
+		case "steam_temp":
+			return analogSourceFunc(func() float64 { return tk.SteamTempC() }), nil
+		default:
+			return nil, fmt.Errorf("source: unsupported tank field '%s'", field)
+		}
+
 	default:
-		return nil, fmt.Errorf("unsupported tank field '%s'", parts[2])
+		return nil, fmt.Errorf("source: unsupported kind '%s'", kind)
 	}
 }
-
-// --- Adapters ---
-
-type TankTempSource struct{ Tank *domain.Tank }
-func (s TankTempSource) Read() float64 { return s.Tank.TempC() }
-
-type TankLevelPctSource struct{ Tank *domain.Tank }
-func (s TankLevelPctSource) Read() float64 { return s.Tank.LevelPct() }
-
-type TankPressureSource struct{ Tank *domain.Tank }
-func (s TankPressureSource) Read() float64 { return s.Tank.PressureBar() }

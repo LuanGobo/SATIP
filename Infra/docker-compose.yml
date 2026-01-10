@@ -1,20 +1,13 @@
-version: '3.8'
-
 services:
-  devices:
-    container_name: devices
+  device_app:
+    container_name: device_app
     build:
       context: ..
       dockerfile: Infra/docker/devices.Dockerfile
     volumes:
       - ../Apps/device_app:/app
       - ./docker/air/device.air.toml:/app/.air.toml
-      
     working_dir: /app
-    ports:
-      - "8080:8080"
+    tty: true
     environment:
       - ENV=development
-
-    command: air -c .air.toml
-    tty: true

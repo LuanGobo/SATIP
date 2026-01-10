@@ -85,6 +85,8 @@ func (t *Tank) CapacityL() float64 { return t.capacityL }
 func (t *Tank) VolumeL() float64   { return t.volumeL }
 func (t *Tank) TempC() float64     { return t.tempC }
 func (t *Tank) PressureBar() float64 { return t.pressureBar }
+func (t *Tank) SteamTempC() float64 { return t.steamTempC }
+func (t *Tank) SteamOn() bool       { return t.steamON }
 
 func (t *Tank) LevelPct() float64 {
 	if t.capacityL == 0 {
