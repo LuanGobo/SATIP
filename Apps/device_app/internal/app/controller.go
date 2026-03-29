@@ -5,10 +5,13 @@ import "fmt"
 type RecipeStep int
 
 const (
-	StepFillProd1 RecipeStep = iota
+	StepFillProd1  RecipeStep = iota
 	StepFillProd2
+	StepHeat
 	StepPressurize
 	StepAgitate
+	StepTransfer
+	StepCIP
 	StepDone
 )
 
@@ -18,10 +21,16 @@ func (s RecipeStep) String() string {
 		return "fill_prod1_to_500L"
 	case StepFillProd2:
 		return "fill_prod2_to_750L"
+	case StepHeat:
+		return "heat_to_60C"
 	case StepPressurize:
 		return "pressurize_to_2bar"
 	case StepAgitate:
 		return "agitate_5min"
+	case StepTransfer:
+		return "transfer_product"
+	case StepCIP:
+		return "cip_cleaning"
 	case StepDone:
 		return "done"
 	default:
@@ -37,7 +46,7 @@ type Controller struct {
 	step         RecipeStep
 	stepStartSec float64
 
-	// guarda último step para gerar evento “phase_changed”
+	// guarda último step para gerar evento "phase_changed"
 	lastStep RecipeStep
 }
 
@@ -89,6 +98,7 @@ func (c *Controller) Apply(m *Model, nowSec float64) (ControlResult, error) {
 	// IDs do seu YAML
 	const (
 		xvProd1 = "xv-01"
+		xvCIP   = "xv-02"
 		xvProd2 = "xv-03"
 		xvAir   = "xv-04"
 		xvVent  = "xv-05"
@@ -101,6 +111,7 @@ func (c *Controller) Apply(m *Model, nowSec float64) (ControlResult, error) {
 
 	// Defaults por tick (garante determinismo)
 	openValve(xvProd1, false)
+	openValve(xvCIP, false)
 	openValve(xvProd2, false)
 	openValve(xvAir, false)
 	openValve(xvSteam, false)
@@ -118,7 +129,7 @@ func (c *Controller) Apply(m *Model, nowSec float64) (ControlResult, error) {
 		c.lastStep = c.step
 	}
 
-	// Sequência por condição (seu exemplo)
+	// Sequência da receita farmacêutica
 	switch c.step {
 
 	case StepFillProd1:
@@ -130,6 +141,16 @@ func (c *Controller) Apply(m *Model, nowSec float64) (ControlResult, error) {
 	case StepFillProd2:
 		openValve(xvProd2, true)
 		if tk.VolumeL() >= 750.0 {
+			c.step = StepHeat
+		}
+
+	case StepHeat:
+		openValve(xvSteam, true)
+		// Abre vent para alívio de pressão se pressão exceder 1.3 bar
+		if tk.PressureBar() > 1.3 {
+			openValve(xvVent, true)
+		}
+		if tk.TempC() >= 60.0 {
 			c.step = StepPressurize
 		}
 
@@ -143,6 +164,23 @@ func (c *Controller) Apply(m *Model, nowSec float64) (ControlResult, error) {
 	case StepAgitate:
 		startMotorFwd(mAgit, true)
 		if nowSec-c.stepStartSec >= 300.0 { // 5 min = 300 s
+			c.step = StepTransfer
+			c.stepStartSec = nowSec
+		}
+
+	case StepTransfer:
+		openValve(xvTrans, true)
+		startMotorFwd(mt01, true)
+		// Transfere até tanque quase vazio ou timeout de 10 min
+		if tk.VolumeL() < 50.0 || nowSec-c.stepStartSec >= 600.0 {
+			c.step = StepCIP
+			c.stepStartSec = nowSec
+		}
+
+	case StepCIP:
+		openValve(xvCIP, true)
+		// CIP roda por 5 minutos
+		if nowSec-c.stepStartSec >= 300.0 {
 			c.step = StepDone
 		}
 

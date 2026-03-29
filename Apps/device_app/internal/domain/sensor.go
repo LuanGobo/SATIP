@@ -28,6 +28,12 @@ type AnalogSensor struct {
 
 	enLL, enL, enH, enHH bool
 	ll, l, h, hh         float64
+
+	// Alarm state tracking (for edge detection)
+	alarmActiveLL bool
+	alarmActiveL  bool
+	alarmActiveH  bool
+	alarmActiveHH bool
 }
 
 func NewAnalogSensor(
@@ -61,6 +67,21 @@ func NewAnalogSensor(
 	}, nil
 }
 
+func (s *AnalogSensor) Value() float64    { return s.value }
+func (s *AnalogSensor) ID() string        { return s.id }
+func (s *AnalogSensor) Tag() string       { return s.tag }
+func (s *AnalogSensor) Kind() string      { return s.kind }
+func (s *AnalogSensor) Deadband() float64 { return s.deadband }
+
+func (s *AnalogSensor) AlarmActiveLL() bool { return s.alarmActiveLL }
+func (s *AnalogSensor) AlarmActiveL() bool  { return s.alarmActiveL }
+func (s *AnalogSensor) AlarmActiveH() bool  { return s.alarmActiveH }
+func (s *AnalogSensor) AlarmActiveHH() bool { return s.alarmActiveHH }
+func (s *AnalogSensor) AlarmEnabledLL() bool { return s.enLL }
+func (s *AnalogSensor) AlarmEnabledL() bool  { return s.enL }
+func (s *AnalogSensor) AlarmEnabledH() bool  { return s.enH }
+func (s *AnalogSensor) AlarmEnabledHH() bool { return s.enHH }
+
 func (s *AnalogSensor) ConfigureAlarms(
 	enLL bool, ll float64,
 	enL bool, l float64,
@@ -93,21 +114,47 @@ func (s *AnalogSensor) Tick(dtSeconds float64) []Event {
 	return s.evalAlarms()
 }
 
+// evalAlarms fires alarm events only on TRANSITIONS (rising edge).
+// When the alarm condition becomes true, it fires once.
+// It does NOT fire again until the condition clears and re-occurs.
 func (s *AnalogSensor) evalAlarms() []Event {
 	var events []Event
 	v := s.value
 
-	if s.enLL && v <= s.ll {
-		events = append(events, s.makeEvent("alarm_ll", v))
+	// LL alarm
+	if s.enLL {
+		wasActive := s.alarmActiveLL
+		s.alarmActiveLL = v <= s.ll
+		if s.alarmActiveLL && !wasActive {
+			events = append(events, s.makeEvent("alarm_ll", v))
+		}
 	}
-	if s.enL && v <= s.l {
-		events = append(events, s.makeEvent("alarm_l", v))
+
+	// L alarm
+	if s.enL {
+		wasActive := s.alarmActiveL
+		s.alarmActiveL = v <= s.l
+		if s.alarmActiveL && !wasActive {
+			events = append(events, s.makeEvent("alarm_l", v))
+		}
 	}
-	if s.enH && v >= s.h {
-		events = append(events, s.makeEvent("alarm_h", v))
+
+	// H alarm
+	if s.enH {
+		wasActive := s.alarmActiveH
+		s.alarmActiveH = v >= s.h
+		if s.alarmActiveH && !wasActive {
+			events = append(events, s.makeEvent("alarm_h", v))
+		}
 	}
-	if s.enHH && v >= s.hh {
-		events = append(events, s.makeEvent("alarm_hh", v))
+
+	// HH alarm
+	if s.enHH {
+		wasActive := s.alarmActiveHH
+		s.alarmActiveHH = v >= s.hh
+		if s.alarmActiveHH && !wasActive {
+			events = append(events, s.makeEvent("alarm_hh", v))
+		}
 	}
 
 	return events

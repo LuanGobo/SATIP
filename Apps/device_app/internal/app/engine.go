@@ -17,11 +17,25 @@ type StepResult struct {
 	TimeSeconds float64
 	Step        int
 
-	Tanks  map[string]TankSnapshot
-	Valves map[string]ValveSnapshot
-	Motors map[string]MotorSnapshot
+	Tanks   map[string]TankSnapshot
+	Valves  map[string]ValveSnapshot
+	Motors  map[string]MotorSnapshot
+	Sensors map[string]SensorSnapshot
 
 	Events []domain.Event
+}
+
+type SensorSnapshot struct {
+	Value    float64
+	Deadband float64
+	AlarmLL  bool
+	AlarmL   bool
+	AlarmH   bool
+	AlarmHH  bool
+	EnabledLL bool
+	EnabledL  bool
+	EnabledH  bool
+	EnabledHH bool
 }
 
 type ValveSnapshot struct {
@@ -165,12 +179,25 @@ func (e *Engine) Step() (StepResult, error) {
 			tk.SetAgitation(motor.IsActive())
 
 		case "transfer_outlet":
-			// Stub: calcula condição de transferência, mas não altera volume ainda.
-			_, err := e.isPathActive(c.Path)
+			tk := e.model.Tanks[c.Source.FromTankID]
+			if tk == nil {
+				return StepResult{}, fmt.Errorf("engine: transfer_outlet from_tank '%s' not found", c.Source.FromTankID)
+			}
+			// Set load on motors in the path based on tank volume
+			for _, pid := range c.Path {
+				if m, ok := e.model.Motors[pid]; ok {
+					m.SetLoad(tk.VolumeL() > 1.0)
+				}
+			}
+			active, err := e.isPathActive(c.Path)
 			if err != nil {
 				return StepResult{}, err
 			}
-			// Próxima etapa: se ativo => tk.RemoveOutflow(...) / deslocar massa etc.
+			if !active {
+				continue
+			}
+			outflowL := (c.Source.NominalFlowLpm / 60.0) * dt
+			tk.RemoveVolume(outflowL)
 
 		default:
 			return StepResult{}, fmt.Errorf("engine: unsupported connection type '%s' (%s)", c.Type, c.ID)
@@ -204,6 +231,23 @@ func (e *Engine) Step() (StepResult, error) {
 		ev := s.Tick(dt)
 		if len(ev) > 0 {
 			events = append(events, ev...)
+		}
+	}
+
+	// 5b) Snapshot sensores
+	sensorsSnap := make(map[string]SensorSnapshot, len(e.model.Sensors))
+	for id, s := range e.model.Sensors {
+		sensorsSnap[id] = SensorSnapshot{
+			Value:     s.Value(),
+			Deadband:  s.Deadband(),
+			AlarmLL:   s.AlarmActiveLL(),
+			AlarmL:    s.AlarmActiveL(),
+			AlarmH:    s.AlarmActiveH(),
+			AlarmHH:   s.AlarmActiveHH(),
+			EnabledLL: s.AlarmEnabledLL(),
+			EnabledL:  s.AlarmEnabledL(),
+			EnabledH:  s.AlarmEnabledH(),
+			EnabledHH: s.AlarmEnabledHH(),
 		}
 	}
 
@@ -243,6 +287,7 @@ func (e *Engine) Step() (StepResult, error) {
 		Tanks:       tanksSnap,
 		Valves:      valvesSnap,
 		Motors:      motorsSnap,
+		Sensors:     sensorsSnap,
 		Events:      events,
 	}
 
