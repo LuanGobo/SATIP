@@ -2,234 +2,190 @@
 package main
 
 import (
-	"encoding/csv"
+	"context"
 	"flag"
-	"fmt"
 	"log"
 	"os"
-	"path/filepath"
-	"sort"
+	"time"
 
 	"device_app/internal/app"
+	"device_app/internal/infra/db"
 )
-
-// bool01 escreve 1/0 para facilitar gráficos (Excel/PowerBI).
-func bool01(b bool) string {
-	if b {
-		return "1"
-	}
-	return "0"
-}
 
 func main() {
 	// CLI
 	cfgPath := flag.String("config", "cmd/simulator/plant.yaml", "path to plant YAML")
-	outDir := flag.String("out", "out", "output directory (CSV files)")
 	flag.Parse()
 
-	// 1) Carrega spec
+	ctx := context.Background()
+
+	// 1) Conexão com Banco de Dados
+	connStr := os.Getenv("POSTGRES_URL")
+	if connStr == "" {
+		// fallback para desenvolvimento local se não estiver no docker
+		connStr = "postgres://tcc_user:tcc_pass@localhost:5432/tcc?sslmode=disable"
+	}
+
+	database, err := db.NewDatabase(ctx, connStr)
+	if err != nil {
+		log.Fatalf("failed to connect to database: %v", err)
+	}
+	defer database.Close()
+
+	// 2) Carrega spec
 	spec, err := app.LoadPlantSpec(*cfgPath)
 	if err != nil {
 		log.Fatalf("load spec: %v", err)
 	}
 
-	// 2) Build model
+	// 3) Build model
 	model, err := app.BuildModel(spec)
 	if err != nil {
 		log.Fatalf("build model: %v", err)
 	}
 
-	// 3) Engine
+	// 4) Garantir equipamentos no banco
+	for _, tk := range spec.Equipment.Tanks {
+		err := database.EnsureEquipment(ctx, tk.ID, tk.Tag, "tank", map[string]interface{}{"capacity": tk.CapacityL})
+		if err != nil {
+			log.Fatalf("ensure tank %s: %v", tk.ID, err)
+		}
+	}
+	for _, v := range spec.Equipment.Valves {
+		err := database.EnsureEquipment(ctx, v.ID, v.Tag, "valve", map[string]interface{}{"service": v.Service})
+		if err != nil {
+			log.Fatalf("ensure valve %s: %v", v.ID, err)
+		}
+	}
+	for _, m := range spec.Equipment.Motors {
+		err := database.EnsureEquipment(ctx, m.ID, m.Tag, "motor", map[string]interface{}{"has_reverse": m.HasReverse})
+		if err != nil {
+			log.Fatalf("ensure motor %s: %v", m.ID, err)
+		}
+	}
+	for _, s := range spec.Equipment.Sensors {
+		err := database.EnsureEquipment(ctx, s.ID, s.Tag, "sensor", map[string]interface{}{"kind": s.Kind, "deadband": s.Deadband})
+		if err != nil {
+			log.Fatalf("ensure sensor %s: %v", s.ID, err)
+		}
+	}
+
+	// 5) Engine
 	engine, err := app.NewEngine(model)
 	if err != nil {
 		log.Fatalf("new engine: %v", err)
 	}
 
-	// 4) Controller (sequência por condição)
-	//
-	// IMPORTANTE: É AQUI que fica a "lógica de comandos" da simulação.
-	// Você NÃO deve programar a lógica no Engine nem no Domain.
-	// O Controller decide (por condição/tempo/estado) quais válvulas/motores ligar/desligar.
-	//
-	// O arquivo onde você implementa a lógica é:
-	//   Apps/device_app/internal/app/controller.go
-	//
-	// Se quiser múltiplos cenários, crie outros controllers (ou parametrizações).
+	// 6) Controller
 	controller := app.NewController("tk-01")
 
-	// 5) Output dir
-	if err := os.MkdirAll(*outDir, 0o755); err != nil {
-		log.Fatalf("mkdir out: %v", err)
-	}
-
-	// 6) CSV timeseries
-	tsPath := filepath.Join(*outDir, "timeseries.csv")
-	tsFile, err := os.Create(tsPath)
-	if err != nil {
-		log.Fatalf("create timeseries.csv: %v", err)
-	}
-	defer tsFile.Close()
-
-	w := csv.NewWriter(tsFile)
-	defer w.Flush()
-
-	// 7) CSV events (sensores + controller)
-	evPath := filepath.Join(*outDir, "events.csv")
-	evFile, err := os.Create(evPath)
-	if err != nil {
-		log.Fatalf("create events.csv: %v", err)
-	}
-	defer evFile.Close()
-
-	ew := csv.NewWriter(evFile)
-	defer ew.Flush()
-
-	// 8) Ordem determinística de IDs (colunas)
-	tankIDs := make([]string, 0, len(model.Tanks))
-	for id := range model.Tanks {
-		tankIDs = append(tankIDs, id)
-	}
-	sort.Strings(tankIDs)
-
-	valveIDs := make([]string, 0, len(model.Valves))
-	for id := range model.Valves {
-		valveIDs = append(valveIDs, id)
-	}
-	sort.Strings(valveIDs)
-
-	motorIDs := make([]string, 0, len(model.Motors))
-	for id := range model.Motors {
-		motorIDs = append(motorIDs, id)
-	}
-	sort.Strings(motorIDs)
-
-	// 9) Header timeseries
-	header := []string{
-		"t_seconds",
-		"step",
-		"recipe_step", // <-- fase atual do Controller (útil para análise)
-		"tank_id",
-		"volume_l",
-		"level_pct",
-		"temp_c",
-		"pressure_bar",
-	}
-
-	for _, id := range valveIDs {
-		header = append(header, id+"_open")
-		header = append(header, id+"_flow")
-	}
-	for _, id := range motorIDs {
-		header = append(header, id+"_state")
-		header = append(header, id+"_active")
-		header = append(header, id+"_rpm")
-	}
-
-	if err := w.Write(header); err != nil {
-		log.Fatalf("write header: %v", err)
-	}
-
-	// Header events
-	if err := ew.Write([]string{"t_seconds", "source", "event", "value"}); err != nil {
-		log.Fatalf("write events header: %v", err)
-	}
-
-	// 10) Loop simulação
+	// 7) Loop simulação
 	totalSteps := int(model.DurationSeconds / model.DTSeconds)
 	if totalSteps < 1 {
 		totalSteps = 1
 	}
 
-	for i := 0; i < totalSteps; i++ {
-		tNow := float64(i) * model.DTSeconds
+	// Tempo base para o banco (simulando tempo real ou histórico)
+	startTime := time.Now().Truncate(time.Second)
 
-		// 10.1) APLICA LÓGICA DE COMANDOS (Controller)
-		//
-		// O controller olha o estado atual (volume, pressão, etc.)
-		// e decide quais comandos aplicar (abrir/fechar válvulas, ligar motores).
-		ctrlRes, err := controller.Apply(model, tNow)
+	log.Printf("Iniciando simulação (%d steps)...", totalSteps)
+
+	batchInterval := 100 // flush a cada 100 ticks
+
+	for i := 0; i < totalSteps; i++ {
+		tNowSim := float64(i) * model.DTSeconds
+		tDB := startTime.Add(time.Duration(tNowSim) * time.Second)
+
+		// 7.1) Controller
+		ctrlRes, err := controller.Apply(model, tNowSim)
 		if err != nil {
 			log.Fatalf("controller apply: %v", err)
 		}
 
-		// (opcional) registrar eventos do controller no events.csv
+		// Registrar eventos do controller (on-change por natureza)
 		for _, ce := range ctrlRes.Events {
-			_ = ew.Write([]string{
-				fmt.Sprintf("%.3f", tNow),
-				"controller",
-				ce,
-				"",
-			})
+			_ = database.LogOnChange(ctx, tDB, "controller", "event", ce)
 		}
+		_ = database.LogOnChange(ctx, tDB, "controller", "recipe_step", ctrlRes.StepName)
 
-		// 10.2) Avança 1 step de simulação (Engine)
+		// 7.2) Engine Step
 		res, err := engine.Step()
 		if err != nil {
 			log.Fatalf("engine step: %v", err)
 		}
 
-		// 10.3) Events dos sensores (engine)
+		// 7.3) Sensores Alarmes (on-change por natureza)
 		for _, ev := range res.Events {
-			_ = ew.Write([]string{
-				fmt.Sprintf("%.3f", ev.TimeSec),
-				"sensor",
-				fmt.Sprintf("%s:%s", ev.Tag, ev.Kind),
-				fmt.Sprintf("%.6f", ev.Value),
-			})
-		}
-
-		// 10.4) Timeseries (1 linha por tanque)
-		for _, tankID := range tankIDs {
-			tk, ok := res.Tanks[tankID]
-			if !ok {
-				continue
-			}
-
-			row := []string{
-				fmt.Sprintf("%.3f", res.TimeSeconds),
-				fmt.Sprintf("%d", res.Step),
-				ctrlRes.StepName,
-				tankID,
-				fmt.Sprintf("%.6f", tk.VolumeL),
-				fmt.Sprintf("%.6f", tk.LevelPct),
-				fmt.Sprintf("%.6f", tk.TempC),
-				fmt.Sprintf("%.6f", tk.PressureBar),
-			}
-
-			for _, vid := range valveIDs {
-				vs, ok := res.Valves[vid]
-				if !ok {
-					row = append(row, "0", "0")
-					continue
+			sensorID := ev.Tag
+			for _, s := range spec.Equipment.Sensors {
+				if s.Tag == ev.Tag {
+					sensorID = s.ID
+					break
 				}
-				row = append(row, bool01(vs.Open), bool01(vs.Flow))
 			}
+			_ = database.LogOnChange(ctx, tDB, sensorID, ev.Kind, ev.Value)
+		}
 
-			for _, mid := range motorIDs {
-				ms, ok := res.Motors[mid]
-				if !ok {
-					row = append(row, "", "0", "0")
-					continue
-				}
-				row = append(row, ms.State, bool01(ms.Active), fmt.Sprintf("%.3f", ms.RPM))
+		// 7.4) Estado dos Tanques — batch a cada tick
+		for id, tk := range res.Tanks {
+			database.AddToBatch(tDB, id, "volume_l", tk.VolumeL)
+			database.AddToBatch(tDB, id, "level_pct", tk.LevelPct)
+			database.AddToBatch(tDB, id, "temp_c", tk.TempC)
+			database.AddToBatch(tDB, id, "pressure_bar", tk.PressureBar)
+		}
+
+		// 7.4b) Sensor readings + alarm states — batch a cada tick
+		for id, ss := range res.Sensors {
+			database.AddToBatch(tDB, id, "value", ss.Value)
+			// Alarmes: só loga quando ativo (valor = leitura do sensor, sobrepõe a linha)
+			if ss.EnabledLL && ss.AlarmLL {
+				database.AddToBatch(tDB, id, "alarm_ll", ss.Value)
 			}
-
-			if err := w.Write(row); err != nil {
-				log.Fatalf("write row: %v", err)
+			if ss.EnabledL && ss.AlarmL {
+				database.AddToBatch(tDB, id, "alarm_l", ss.Value)
+			}
+			if ss.EnabledH && ss.AlarmH {
+				database.AddToBatch(tDB, id, "alarm_h", ss.Value)
+			}
+			if ss.EnabledHH && ss.AlarmHH {
+				database.AddToBatch(tDB, id, "alarm_hh", ss.Value)
 			}
 		}
 
-		// flush incremental
-		w.Flush()
-		if err := w.Error(); err != nil {
-			log.Fatalf("timeseries flush: %v", err)
+		// 7.5) Válvulas — batch a cada tick
+		for id, vs := range res.Valves {
+			openVal := 0.0
+			if vs.Open {
+				openVal = 1.0
+			}
+			database.AddToBatch(tDB, id, "is_open", openVal)
 		}
-		ew.Flush()
-		if err := ew.Error(); err != nil {
-			log.Fatalf("events flush: %v", err)
+
+		// 7.6) Motores — batch a cada tick
+		for id, ms := range res.Motors {
+			activeVal := 0.0
+			if ms.Active {
+				activeVal = 1.0
+			}
+			database.AddToBatch(tDB, id, "active", activeVal)
+			database.AddToBatch(tDB, id, "rpm", ms.RPM)
+		}
+
+		// Flush batch periodicamente
+		if (i+1)%batchInterval == 0 || i == totalSteps-1 {
+			if err := database.FlushBatch(ctx); err != nil {
+				log.Fatalf("flush batch at step %d: %v", i, err)
+			}
+			if (i+1)%(batchInterval*50) == 0 {
+				log.Printf("Progresso: %d/%d steps (%.0f%%)", i+1, totalSteps, float64(i+1)/float64(totalSteps)*100)
+			}
 		}
 	}
 
-	log.Printf("OK: gerado %s", tsPath)
-	log.Printf("OK: gerado %s", evPath)
+	// Flush final
+	if err := database.FlushBatch(ctx); err != nil {
+		log.Fatalf("flush final batch: %v", err)
+	}
+
+	log.Printf("Simulação concluída com sucesso. Dados salvos no PostgreSQL.")
 }

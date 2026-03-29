@@ -1,13 +1,38 @@
 services:
-  device_app:
-    container_name: device_app
+  dashboard_api:
+    container_name: dashboard_api
     build:
       context: ..
-      dockerfile: Infra/docker/devices.Dockerfile
-    volumes:
-      - ../Apps/device_app:/app
-      - ./docker/air/device.air.toml:/app/.air.toml
-    working_dir: /app
-    tty: true
+      dockerfile: Infra/docker/dashboard_api.Dockerfile
+    depends_on:
+      - timescaledb
     environment:
-      - ENV=development
+      - POSTGRES_URL=postgres://tcc_user:tcc_pass@timescaledb:5432/tcc?sslmode=disable
+    ports:
+      - "8080:8080"
+
+  dashboard_web:
+    container_name: dashboard_web
+    build:
+      context: ..
+      dockerfile: Infra/docker/dashboard_web.Dockerfile
+    depends_on:
+      - dashboard_api
+    ports:
+      - "3000:3000"
+
+  timescaledb:
+    image: timescale/timescaledb:latest-pg16
+    container_name: timescaledb
+    ports:
+      - "5432:5432"
+    environment:
+      - POSTGRES_DB=tcc
+      - POSTGRES_USER=tcc_user
+      - POSTGRES_PASSWORD=tcc_pass
+    volumes:
+      - ./docker/postgres/init.sql:/docker-entrypoint-initdb.d/init.sql
+      - timescale_data:/var/lib/postgresql/data
+
+volumes:
+  timescale_data:

@@ -27,8 +27,9 @@ type Tank struct {
 	agitationON bool
 
 	// Vapor
-	steamON    bool
-	steamTempC float64
+	steamON         bool
+	steamSupplyTempC float64 // temperatura da fonte de vapor (ex: 140°C)
+	steamTempC      float64  // temperatura real da camisa (dinâmica)
 
 	// Parâmetros térmicos
 	uaWPerk        float64
@@ -95,6 +96,13 @@ func (t *Tank) LevelPct() float64 {
 	return (t.volumeL / t.capacityL) * 100.0
 }
 
+func (t *Tank) RemoveVolume(liters float64) {
+	t.volumeL -= liters
+	if t.volumeL < 0 {
+		t.volumeL = 0
+	}
+}
+
 // --- Setters (inputs do Engine) ---
 
 func (t *Tank) SetInFlow(flowLpm, tempC float64) {
@@ -109,9 +117,9 @@ func (t *Tank) SetAgitation(on bool) {
 	t.agitationON = on
 }
 
-func (t *Tank) SetSteamJacket(on bool, steamTempC float64) {
+func (t *Tank) SetSteamJacket(on bool, supplyTempC float64) {
 	t.steamON = on
-	t.steamTempC = steamTempC
+	t.steamSupplyTempC = supplyTempC
 }
 
 func (t *Tank) SetCleanAirInflow(flowNlpm float64) {
@@ -158,8 +166,19 @@ func (t *Tank) Tick(dtSeconds float64) {
 		t.tempC += alpha * (t.inFlowTempC - t.tempC)
 	}
 
-	// Aquecimento por vapor
+	// Dinâmica térmica da camisa de vapor
 	if t.steamON {
+		// Camisa aquece em direção à temperatura de fornecimento
+		jacketTau := 0.02 // constante de tempo rápida (vapor condensa rápido)
+		t.steamTempC += jacketTau * (t.steamSupplyTempC - t.steamTempC) * dtSeconds
+	} else {
+		// Camisa esfria em direção à temperatura ambiente (25°C)
+		jacketCoolTau := 0.005 // esfria mais devagar
+		t.steamTempC += jacketCoolTau * (25.0 - t.steamTempC) * dtSeconds
+	}
+
+	// Aquecimento do produto pelo vapor da camisa
+	if t.steamTempC > t.tempC+1.0 {
 		uaEff := t.uaWPerk
 		if t.agitationON {
 			uaEff *= 1.25
