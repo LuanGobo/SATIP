@@ -52,7 +52,14 @@ func (db *Database) EnsureEquipment(ctx context.Context, id, tag, typeName strin
 	var typeID int
 	err := db.pool.QueryRow(ctx, "SELECT id FROM equipment_type WHERE name = $1", typeName).Scan(&typeID)
 	if err != nil {
-		return fmt.Errorf("get equipment type %s: %v", typeName, err)
+		err = db.pool.QueryRow(ctx, `
+			INSERT INTO equipment_type (name) VALUES ($1)
+			ON CONFLICT (name) DO UPDATE SET name = $1
+			RETURNING id
+		`, typeName).Scan(&typeID)
+		if err != nil {
+			return fmt.Errorf("get equipment type %s: %v", typeName, err)
+		}
 	}
 
 	metaJSON, _ := json.Marshal(metadata)

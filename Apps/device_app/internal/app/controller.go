@@ -48,6 +48,18 @@ type Controller struct {
 
 	// guarda último step para gerar evento "phase_changed"
 	lastStep RecipeStep
+
+	// Realimentação de alarmes do tick anterior (setada pelo loop principal).
+	// Usada para reagir a falhas do processo com uma ação corretiva.
+	// Histerese: entra em correção no alarme HH (175°C) e só sai quando a
+	// temperatura cai abaixo do alarme H (160°C) — evita chaveamento rápido
+	// da válvula (chattering) perto do limiar HH.
+	jacketCorrecting bool
+	productOverTemp  bool
+	wasCorrecting    bool
+
+	// Comando corrente da válvula de vapor no ciclo de controle da camisa.
+	steamCmd bool
 }
 
 func NewController(tankID string) *Controller {
@@ -56,6 +68,16 @@ func NewController(tankID string) *Controller {
 		step:     StepFillProd1,
 		lastStep: -1,
 	}
+}
+
+// SetAlarmFeedback recebe o estado de alarme apurado no tick anterior, para
+// que o controlador possa reagir a condições fora de especificação. A
+// sobretemperatura do produto (TIT-01) constitui intertravamento de segurança
+// e atua em qualquer etapa da receita; a sobretemperatura da camisa (TIT-02)
+// atua durante o aquecimento.
+func (c *Controller) SetAlarmFeedback(productH, jacketH bool) {
+	c.productOverTemp = productH
+	c.jacketCorrecting = jacketH
 }
 
 type ControlResult struct {
@@ -145,7 +167,24 @@ func (c *Controller) Apply(m *Model, nowSec float64) (ControlResult, error) {
 		}
 
 	case StepHeat:
-		openValve(xvSteam, true)
+		// A válvula de vapor é do tipo abre-fecha, mas o controlador a opera
+		// em ciclos curtos para manter a camisa próxima do setpoint, com
+		// banda morta estreita. Como o atuador leva alguns segundos para
+		// cursar e a camisa tem inércia térmica, o resultado é uma ondulação
+		// suave em torno do setpoint, e não um degrau entre extremos.
+		const (
+			jacketSetpointC = 135.0
+			jacketBandC     = 1.5
+		)
+		jacket := tk.SteamTempC()
+		switch {
+		case jacket > jacketSetpointC+jacketBandC:
+			c.steamCmd = false
+		case jacket < jacketSetpointC-jacketBandC:
+			c.steamCmd = true
+		}
+		openValve(xvSteam, c.steamCmd)
+
 		// Abre vent para alívio de pressão se pressão exceder 1.3 bar
 		if tk.PressureBar() > 1.3 {
 			openValve(xvVent, true)
@@ -186,6 +225,27 @@ func (c *Controller) Apply(m *Model, nowSec float64) (ControlResult, error) {
 
 	case StepDone:
 		// defaults já deixam tudo off
+	}
+
+	// Intertravamento de segurança, sobreposto à decisão normal da etapa: a
+	// sobretemperatura do produto força o fechamento da válvula de vapor e a
+	// abertura do respiro, em qualquer etapa da receita. Note que o comando
+	// de fechamento nem sempre surte efeito — se o atuador estiver obstruído,
+	// a passagem residual de vapor persiste e a condição não se resolve, o
+	// que é justamente o cenário que só o histórico permite diagnosticar.
+	if c.productOverTemp || (c.jacketCorrecting && c.step == StepHeat) {
+		openValve(xvSteam, false)
+		openValve(xvVent, true)
+		if !c.wasCorrecting {
+			reason := "jacket_temp_high"
+			if c.productOverTemp {
+				reason = "product_temp_high"
+			}
+			ev = append(ev, "corrective_action:steam_closed_"+reason)
+			c.wasCorrecting = true
+		}
+	} else {
+		c.wasCorrecting = false
 	}
 
 	return ControlResult{

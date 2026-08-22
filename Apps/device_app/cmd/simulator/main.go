@@ -5,6 +5,7 @@ import (
 	"context"
 	"flag"
 	"log"
+	"math/rand"
 	"os"
 	"time"
 
@@ -12,10 +13,43 @@ import (
 	"device_app/internal/infra/db"
 )
 
+// jitterConnections aplica variação aleatória de corrida a corrida às vazões
+// e temperaturas de entrada, alterando o tempo necessário para encher,
+// esvaziar, aquecer e resfriar o tanque.
+func jitterConnections(spec *app.PlantSpec, rng *rand.Rand) {
+	for i := range spec.Connections {
+		c := &spec.Connections[i]
+		switch c.Type {
+		case "product_inlet", "cip_inlet":
+			c.Source.FlowLpm *= 1.0 + (rng.Float64()*2-1)*0.20
+			c.Source.TempC += (rng.Float64()*2 - 1) * 3.0
+
+		case "clean_air_inlet":
+			c.Source.FlowNlpm *= 1.0 + (rng.Float64()*2-1)*0.20
+
+		case "transfer_outlet":
+			c.Source.NominalFlowLpm *= 1.0 + (rng.Float64()*2-1)*0.20
+
+		case "steam_jacket":
+			c.Source.TempC += (rng.Float64()*2 - 1) * 5.0
+		}
+	}
+}
+
 func main() {
 	// CLI
 	cfgPath := flag.String("config", "cmd/simulator/plant.yaml", "path to plant YAML")
+	fouling := flag.Float64("fouling", 1.0, "fator de incrustacao da camisa (1.0 = limpa)")
+	offsetH := flag.Float64("offset-h", 0, "deslocamento do instante inicial, em horas")
+	seedFlag := flag.Int64("seed", 0, "semente aleatoria para variabilidade da corrida (0 = usa o relogio, diferente a cada execucao)")
 	flag.Parse()
+
+	seed := *seedFlag
+	if seed == 0 {
+		seed = time.Now().UnixNano()
+	}
+	rng := rand.New(rand.NewSource(seed))
+	log.Printf("Semente desta simulação: %d", seed)
 
 	ctx := context.Background()
 
@@ -38,10 +72,41 @@ func main() {
 		log.Fatalf("load spec: %v", err)
 	}
 
+	// 2.1) Variabilidade natural entre corridas: vazões e temperaturas de
+	// entrada variam, alterando os tempos de enchimento, esvaziamento,
+	// aquecimento e resfriamento.
+	jitterConnections(spec, rng)
+
 	// 3) Build model
 	model, err := app.BuildModel(spec)
 	if err != nil {
 		log.Fatalf("build model: %v", err)
+	}
+
+	for _, tk := range model.Tanks {
+		tk.SetFoulingFactor(*fouling)
+		// Variabilidade natural de corrida a corrida no tempo de aquecimento e
+		// de resfriamento (±20% e ±25%), independente da falha de incrustação
+		// controlada pela flag -fouling.
+		tk.SetFoulingFactor(1.0 + (rng.Float64()*2-1)*0.20)
+		tk.SetCoolingFactor(1.0 + (rng.Float64()*2-1)*0.25)
+	}
+
+	// 3.1) Falha aleatória de processo: com 35% de chance, o atuador da
+	// válvula de vapor apresenta obstrução mecânica e não fecha por completo.
+	// O controlador continua comandando o fechamento na banda de controle,
+	// mas a passagem residual de vapor faz a camisa subir além do setpoint e
+	// cruzar os limites de alarme de TIT-02 — condição que o controle sozinho
+	// não consegue corrigir e que só é diagnosticável pelo histórico.
+	if steamValve, ok := model.Valves["xv-06"]; ok && rng.Float64() < 0.35 {
+		stuck := 0.30 + rng.Float64()*0.25 // 30% a 55% de abertura residual
+		steamValve.SetStuckMinimum(stuck)
+		log.Printf("Falha simulada: atuador de XV-06 obstruido, abertura residual de %.0f%%", stuck*100)
+	}
+
+	// Variação do tempo de curso dos atuadores entre corridas
+	for _, v := range model.Valves {
+		v.SetStrokeSeconds(8.0 + rng.Float64()*10.0) // 8 a 18 s
 	}
 
 	// 4) Garantir equipamentos no banco
@@ -69,12 +134,16 @@ func main() {
 			log.Fatalf("ensure sensor %s: %v", s.ID, err)
 		}
 	}
+	if err := database.EnsureEquipment(ctx, "controller", "CTRL-01", "controller", nil); err != nil {
+		log.Fatalf("ensure controller: %v", err)
+	}
 
 	// 5) Engine
 	engine, err := app.NewEngine(model)
 	if err != nil {
 		log.Fatalf("new engine: %v", err)
 	}
+	engine.SetRNG(rng)
 
 	// 6) Controller
 	controller := app.NewController("tk-01")
@@ -86,7 +155,8 @@ func main() {
 	}
 
 	// Tempo base para o banco (simulando tempo real ou histórico)
-	startTime := time.Now().Truncate(time.Second)
+	startTime := time.Now().Truncate(time.Second).
+		Add(time.Duration(*offsetH * float64(time.Hour)))
 
 	log.Printf("Iniciando simulação (%d steps)...", totalSteps)
 
@@ -134,6 +204,19 @@ func main() {
 			database.AddToBatch(tDB, id, "pressure_bar", tk.PressureBar)
 		}
 
+		// 7.4a) Realimenta o controlador com o alarme HH de TIT-02 apurado
+		// neste tick, para reagir no próximo (defasagem de 1 tick, como um
+		// ciclo de varredura real).
+		productH := false
+		if s, ok := res.Sensors["tit-01"]; ok {
+			productH = s.EnabledH && s.AlarmH
+		}
+		jacketH := false
+		if s, ok := res.Sensors["tit-02"]; ok {
+			jacketH = s.EnabledH && s.AlarmH
+		}
+		controller.SetAlarmFeedback(productH, jacketH)
+
 		// 7.4b) Sensor readings + alarm states — batch a cada tick
 		for id, ss := range res.Sensors {
 			database.AddToBatch(tDB, id, "value", ss.Value)
@@ -159,6 +242,7 @@ func main() {
 				openVal = 1.0
 			}
 			database.AddToBatch(tDB, id, "is_open", openVal)
+			database.AddToBatch(tDB, id, "position", vs.Position)
 		}
 
 		// 7.6) Motores — batch a cada tick
