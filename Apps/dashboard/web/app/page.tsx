@@ -20,6 +20,7 @@ import {
   CartesianGrid,
   Tooltip,
   ResponsiveContainer,
+  ReferenceArea,
 } from "recharts";
 
 const API_URL = "http://localhost:8080/api";
@@ -65,6 +66,12 @@ export default function DashboardPage() {
   const [collapsedCats, setCollapsedCats] = useState({});
   const [activeYAxisKey, setActiveYAxisKey] = useState<string | null>(null);
   const [hoveredLegend, setHoveredLegend] = useState<string | null>(null);
+
+  // Selecao de janela de tempo por arrasto sobre o grafico
+  const [refAreaLeft, setRefAreaLeft] = useState<number | null>(null);
+  const [refAreaRight, setRefAreaRight] = useState<number | null>(null);
+  const [isSelecting, setIsSelecting] = useState(false);
+  const [zoomDomain, setZoomDomain] = useState<[number, number] | null>(null);
 
   useEffect(() => {
     fetch(`${API_URL}/equipment`)
@@ -126,7 +133,7 @@ export default function DashboardPage() {
 
   // Merge history data for Recharts (multi-metric, filtering hidden metrics)
   const { chartData, seriesKeys } = useMemo(() => {
-    const timeMap: Record<string, any> = {};
+    const timeMap: Record<number, any> = {};
     const keys = new Set<string>();
 
     (selectedEqIds as any[]).forEach(id => {
@@ -138,20 +145,64 @@ export default function DashboardPage() {
         const metric = point.metric || 'value';
         if (HIDDEN_METRICS.has(metric)) return;
 
-        const timeStr = new Date(point.time).toLocaleTimeString();
+        const d = new Date(point.time);
+        const ts = d.getTime(); // chave numérica (evita colisão e ordenação lexicográfica)
         const seriesKey = `${id}::${metric}`;
         keys.add(seriesKey);
 
-        if (!timeMap[timeStr]) timeMap[timeStr] = { time: timeStr };
-        timeMap[timeStr][seriesKey] = point.value;
+        if (!timeMap[ts]) timeMap[ts] = { ts, time: d.toLocaleTimeString() };
+        timeMap[ts][seriesKey] = point.value;
       });
     });
 
     return {
-      chartData: Object.values(timeMap).sort((a: any, b: any) => a.time.localeCompare(b.time)),
+      chartData: Object.values(timeMap).sort((a: any, b: any) => a.ts - b.ts),
       seriesKeys: Array.from(keys),
     };
   }, [allHistory, selectedEqIds]);
+
+  // Handlers da selecao por arrasto: pressiona, arrasta, solta e filtra.
+  const handleMouseDown = useCallback((e: any) => {
+    if (!e || e.activeLabel === undefined || e.activeLabel === null) return;
+    setRefAreaLeft(Number(e.activeLabel));
+    setRefAreaRight(null);
+    setIsSelecting(true);
+  }, []);
+
+  const handleMouseMove = useCallback((e: any) => {
+    if (!isSelecting) return;
+    if (!e || e.activeLabel === undefined || e.activeLabel === null) return;
+    setRefAreaRight(Number(e.activeLabel));
+  }, [isSelecting]);
+
+  const handleMouseUp = useCallback(() => {
+    setIsSelecting(false);
+    if (refAreaLeft === null || refAreaRight === null || refAreaLeft === refAreaRight) {
+      setRefAreaLeft(null);
+      setRefAreaRight(null);
+      return;
+    }
+    const left = Math.min(refAreaLeft, refAreaRight);
+    const right = Math.max(refAreaLeft, refAreaRight);
+    setZoomDomain([left, right]);
+    setRefAreaLeft(null);
+    setRefAreaRight(null);
+  }, [refAreaLeft, refAreaRight]);
+
+  const resetZoom = useCallback(() => {
+    setZoomDomain(null);
+    setRefAreaLeft(null);
+    setRefAreaRight(null);
+    setIsSelecting(false);
+  }, []);
+
+  // Linhas visiveis na janela atual (usadas para escalar o eixo Y)
+  const visibleData = useMemo(() => {
+    if (!zoomDomain) return chartData;
+    return (chartData as any[]).filter(
+      (row: any) => row.ts >= zoomDomain[0] && row.ts <= zoomDomain[1]
+    );
+  }, [chartData, zoomDomain]);
 
   // Compute Y-axis domain based on active legend selection
   const yAxisDomain = useMemo(() => {
@@ -160,11 +211,11 @@ export default function DashboardPage() {
       const range = METRIC_RANGES[metric];
       if (range) return range;
     }
-    // Auto: compute from all visible data
+    // Auto: computa a partir dos dados visiveis na janela atual
     let min = Infinity;
     let max = -Infinity;
     seriesKeys.forEach(key => {
-      chartData.forEach(row => {
+      visibleData.forEach(row => {
         const v = row[key];
         if (v !== undefined && v !== null) {
           if (v < min) min = v;
@@ -175,7 +226,7 @@ export default function DashboardPage() {
     if (min === Infinity) return [0, 100];
     const padding = (max - min) * 0.1 || 1;
     return [Math.max(0, Math.floor(min - padding)), Math.ceil(max + padding)];
-  }, [activeYAxisKey, seriesKeys, chartData]);
+  }, [activeYAxisKey, seriesKeys, visibleData]);
 
   const handleLegendClick = useCallback((key: string) => {
     setActiveYAxisKey(prev => prev === key ? null : key);
@@ -284,6 +335,26 @@ export default function DashboardPage() {
           <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '1.5rem' }}>
             <h2 style={{ fontSize: '1.25rem' }}>Análise de Processo</h2>
             <div style={{ display: 'flex', alignItems: 'center', gap: '1rem' }}>
+              {zoomDomain && (
+                <>
+                  <div className="label" style={{ fontSize: '0.7rem', color: 'var(--primary)' }}>
+                    {new Date(zoomDomain[0]).toLocaleTimeString()} — {new Date(zoomDomain[1]).toLocaleTimeString()}
+                  </div>
+                  <button
+                    className="btn"
+                    style={{
+                      fontSize: '0.72rem',
+                      padding: '5px 12px',
+                      background: 'rgba(99, 102, 241, 0.12)',
+                      color: 'var(--primary)',
+                      border: '1px solid var(--primary)',
+                    }}
+                    onClick={resetZoom}
+                  >
+                    Resetar Período
+                  </button>
+                </>
+              )}
               {activeYAxisKey && (
                 <button
                   className="btn-ghost"
@@ -299,10 +370,23 @@ export default function DashboardPage() {
 
           <div style={{ width: '100%', height: 'calc(100% - 100px)' }}>
             <ResponsiveContainer width="100%" height="100%">
-              <LineChart data={chartData}>
+              <LineChart
+                data={visibleData}
+                onMouseDown={handleMouseDown}
+                onMouseMove={handleMouseMove}
+                onMouseUp={handleMouseUp}
+                onMouseLeave={handleMouseUp}
+                style={{ userSelect: 'none', cursor: isSelecting ? 'col-resize' : 'crosshair' }}
+              >
                 <CartesianGrid strokeDasharray="3 3" stroke="rgba(100,116,139,0.1)" vertical={false} />
                 <XAxis
-                  dataKey="time"
+                  dataKey="ts"
+                  type="number"
+                  scale="time"
+                  domain={zoomDomain ?? ['dataMin', 'dataMax']}
+                  allowDataOverflow={true}
+                  tickFormatter={(v: number) => new Date(v).toLocaleTimeString()}
+                  minTickGap={60}
                   stroke="#94a3b8"
                   fontSize={11}
                   tickLine={false}
@@ -324,6 +408,7 @@ export default function DashboardPage() {
                     borderRadius: '12px',
                     boxShadow: '0 10px 15px -3px rgba(0,0,0,0.1)',
                   }}
+                  labelFormatter={(v: number) => new Date(v).toLocaleTimeString()}
                   formatter={(value: number, name: string) => {
                     return [typeof value === 'number' ? value.toFixed(2) : value, name];
                   }}
@@ -346,6 +431,15 @@ export default function DashboardPage() {
                     />
                   );
                 })}
+                {refAreaLeft !== null && refAreaRight !== null && (
+                  <ReferenceArea
+                    x1={refAreaLeft}
+                    x2={refAreaRight}
+                    strokeOpacity={0.3}
+                    fill="var(--primary)"
+                    fillOpacity={0.15}
+                  />
+                )}
               </LineChart>
             </ResponsiveContainer>
           </div>

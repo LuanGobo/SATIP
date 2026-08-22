@@ -21,20 +21,24 @@ type Tank struct {
 
 	// Headspace / pressão
 	cleanAirFlowNlpm float64
-	ventOpen         bool
+	ventOpening      float64 // abertura efetiva do respiro (0 a 1)
 
 	// Agitação
 	agitationON bool
 
 	// Vapor
-	steamON         bool
+	steamOpening     float64 // abertura efetiva da válvula de vapor (0 a 1)
 	steamSupplyTempC float64 // temperatura da fonte de vapor (ex: 140°C)
-	steamTempC      float64  // temperatura real da camisa (dinâmica)
+	steamTempC       float64 // temperatura real da camisa (dinâmica)
+
+	// Ambiente
+	ambientTempC float64
 
 	// Parâmetros térmicos
 	uaWPerk        float64
 	cpJPerKgK      float64
 	densityKgPerL  float64
+	jacketCoolTau  float64
 
 	// Parâmetros de pressão
 	gasGainCoeff    float64
@@ -65,10 +69,13 @@ func NewTank(
 		pressureBar:   1.0,
 
 		inFlowTempC:   initialTempC,
+		steamTempC:    initialTempC, // camisa em equilíbrio com o ambiente
+		ambientTempC:  initialTempC,
 
-		uaWPerk:        900.0,
+		uaWPerk:        400.0,
 		cpJPerKgK:      4180.0,
 		densityKgPerL:  1.0,
+		jacketCoolTau:  0.00114,
 
 		gasGainCoeff:   0.002,
 		ventReliefCoeff: 1.5,
@@ -87,7 +94,7 @@ func (t *Tank) VolumeL() float64   { return t.volumeL }
 func (t *Tank) TempC() float64     { return t.tempC }
 func (t *Tank) PressureBar() float64 { return t.pressureBar }
 func (t *Tank) SteamTempC() float64 { return t.steamTempC }
-func (t *Tank) SteamOn() bool       { return t.steamON }
+func (t *Tank) SteamOn() bool       { return t.steamOpening > 0 }
 
 func (t *Tank) LevelPct() float64 {
 	if t.capacityL == 0 {
@@ -117,8 +124,16 @@ func (t *Tank) SetAgitation(on bool) {
 	t.agitationON = on
 }
 
-func (t *Tank) SetSteamJacket(on bool, supplyTempC float64) {
-	t.steamON = on
+// SetSteamJacket recebe a abertura efetiva da válvula de vapor (0 a 1), de
+// modo que a taxa de aquecimento da camisa acompanhe o curso do atuador.
+func (t *Tank) SetSteamJacket(opening float64, supplyTempC float64) {
+	if opening < 0 {
+		opening = 0
+	}
+	if opening > 1 {
+		opening = 1
+	}
+	t.steamOpening = opening
 	t.steamSupplyTempC = supplyTempC
 }
 
@@ -129,8 +144,39 @@ func (t *Tank) SetCleanAirInflow(flowNlpm float64) {
 	t.cleanAirFlowNlpm = flowNlpm
 }
 
-func (t *Tank) SetVentOpen(open bool) {
-	t.ventOpen = open
+// SetVentOpen recebe a abertura efetiva do respiro (0 a 1); o alívio de
+// pressão é proporcional a essa abertura.
+func (t *Tank) SetVentOpen(opening float64) {
+	if opening < 0 {
+		opening = 0
+	}
+	if opening > 1 {
+		opening = 1
+	}
+	t.ventOpening = opening
+}
+
+// SetFoulingFactor aplica um fator multiplicativo ao coeficiente global de
+// transferência de calor, representando a incrustação progressiva da camisa.
+// Valor 1.0 corresponde à condição limpa; valores menores representam
+// deposição de resíduo na parede da camisa.
+func (t *Tank) SetFoulingFactor(f float64) {
+	if f <= 0 {
+		return
+	}
+	t.uaWPerk *= f
+}
+
+// SetCoolingFactor aplica um fator multiplicativo à constante de resfriamento
+// da camisa, permitindo variar de corrida para corrida o tempo necessário
+// para a camisa retornar à temperatura ambiente após o fechamento da válvula
+// de vapor. Valor 1.0 mantém o tempo nominal; valores menores alongam o
+// resfriamento.
+func (t *Tank) SetCoolingFactor(f float64) {
+	if f <= 0 {
+		return
+	}
+	t.jacketCoolTau *= f
 }
 
 // --- Dinâmica ---
@@ -157,25 +203,28 @@ func (t *Tank) Tick(dtSeconds float64) {
 		massKg = 0.001
 	}
 
-	// Mistura térmica (produto)
-	if t.inflowLpm > 0 {
-		alpha := 0.05
-		if t.agitationON {
-			alpha = 0.15
+	// Mistura térmica (produto): balanço de energia entre a massa já contida
+	// no tanque e a massa admitida neste passo. A fração de mistura resulta da
+	// razão entre as massas, e não de um coeficiente fixo — de modo que
+	// encher um tanque cheio altera a temperatura menos que encher um vazio,
+	// e a temperatura resultante nunca ultrapassa a da corrente de entrada.
+	if t.inflowLpm > 0 && massKg > 0 {
+		dMassKg := (t.inflowLpm / 60.0) * dtSeconds * t.densityKgPerL
+		if dMassKg > massKg {
+			dMassKg = massKg
 		}
-		t.tempC += alpha * (t.inFlowTempC - t.tempC)
+		prevMassKg := massKg - dMassKg
+		t.tempC = (prevMassKg*t.tempC + dMassKg*t.inFlowTempC) / massKg
 	}
 
-	// Dinâmica térmica da camisa de vapor
-	if t.steamON {
-		// Camisa aquece em direção à temperatura de fornecimento
-		jacketTau := 0.02 // constante de tempo rápida (vapor condensa rápido)
-		t.steamTempC += jacketTau * (t.steamSupplyTempC - t.steamTempC) * dtSeconds
-	} else {
-		// Camisa esfria em direção à temperatura ambiente (25°C)
-		jacketCoolTau := 0.005 // esfria mais devagar
-		t.steamTempC += jacketCoolTau * (25.0 - t.steamTempC) * dtSeconds
-	}
+	// Dinâmica térmica da camisa de vapor. O aquecimento é proporcional à
+	// abertura da válvula e o resfriamento ao seu complemento, de modo que a
+	// transição entre aquecer e resfriar acompanhe o curso do atuador em vez
+	// de comutar de forma instantânea.
+	jacketHeatTau := 0.02 // constante de tempo rápida (vapor condensa rápido)
+	heatRate := jacketHeatTau * t.steamOpening * (t.steamSupplyTempC - t.steamTempC)
+	coolRate := t.jacketCoolTau * (1.0 - t.steamOpening) * (t.ambientTempC - t.steamTempC)
+	t.steamTempC += (heatRate + coolRate) * dtSeconds
 
 	// Aquecimento do produto pelo vapor da camisa
 	if t.steamTempC > t.tempC+1.0 {
@@ -197,8 +246,8 @@ func (t *Tank) Tick(dtSeconds float64) {
 	pressGain := (t.cleanAirFlowNlpm / headspaceL) * t.gasGainCoeff
 
 	pressRelief := 0.0
-	if t.ventOpen {
-		pressRelief = (t.pressureBar - 1.0) * t.ventReliefCoeff
+	if t.ventOpening > 0 {
+		pressRelief = (t.pressureBar - 1.0) * t.ventReliefCoeff * t.ventOpening
 	}
 
 	t.pressureBar += (pressGain - pressRelief) * dtSeconds

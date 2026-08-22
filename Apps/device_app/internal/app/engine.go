@@ -2,6 +2,7 @@ package app
 
 import (
 	"fmt"
+	"math/rand"
 
 	"device_app/internal/domain"
 )
@@ -11,6 +12,9 @@ type Engine struct {
 
 	tSeconds float64
 	step     int
+
+	rng   *rand.Rand
+	noise map[string]float64
 }
 
 type StepResult struct {
@@ -39,8 +43,9 @@ type SensorSnapshot struct {
 }
 
 type ValveSnapshot struct {
-	Open bool
-	Flow bool
+	Open     bool
+	Flow     bool
+	Position float64
 }
 
 type MotorSnapshot struct {
@@ -65,7 +70,15 @@ func NewEngine(m *Model) (*Engine, error) {
 	if m.DTSeconds <= 0 {
 		return nil, fmt.Errorf("engine: DTSeconds must be > 0")
 	}
-	return &Engine{model: m}, nil
+	return &Engine{
+		model: m,
+		noise: map[string]float64{},
+	}, nil
+}
+
+// SetRNG habilita a variação natural de vazão nas linhas da planta.
+func (e *Engine) SetRNG(r *rand.Rand) {
+	e.rng = r
 }
 
 // Step executa 1 tick da simulação.
@@ -75,10 +88,16 @@ func (e *Engine) Step() (StepResult, error) {
 	// 1) Resetar inputs "instantâneos" por tick
 	for _, tk := range e.model.Tanks {
 		tk.SetInFlow(0, tk.TempC())  // sem entrada por padrão; temp default = temp atual
-		tk.SetSteamJacket(false, 0)  // steam off
+		tk.SetSteamJacket(0, 0)      // steam off
 		tk.SetCleanAirInflow(0)      // sem ar limpo
-		tk.SetVentOpen(false)        // vent fechado por padrão (vai abrir se conexão ativa)
+		tk.SetVentOpen(0)            // vent fechado por padrão (vai abrir se conexão ativa)
 		tk.SetAgitation(false)       // agitação off por padrão (vai ligar se motor ativo)
+	}
+
+	// 1b) Avançar o curso dos atuadores das válvulas em direção ao estado
+	// comandado pelo controlador neste tick.
+	for _, v := range e.model.Valves {
+		v.Tick(dt)
 	}
 
 	// 2) Interpretar conexões e aplicar comandos aos equipamentos
@@ -93,11 +112,11 @@ func (e *Engine) Step() (StepResult, error) {
 		switch c.Type {
 
 		case "product_inlet", "cip_inlet":
-			active, err := e.isPathActive(c.Path)
+			factor, err := e.pathFactor(c.Path)
 			if err != nil {
 				return StepResult{}, err
 			}
-			if !active {
+			if factor <= 0 {
 				continue
 			}
 
@@ -108,7 +127,7 @@ func (e *Engine) Step() (StepResult, error) {
 				inflows[tankID] = acc
 			}
 
-			q := c.Source.FlowLpm
+			q := c.Source.FlowLpm * factor * e.flowNoise(c.ID, dt)
 			if q < 0 {
 				q = 0
 			}
@@ -116,26 +135,23 @@ func (e *Engine) Step() (StepResult, error) {
 			acc.tempWeighted += q * c.Source.TempC
 
 		case "steam_jacket":
-			active, err := e.isPathActive(c.Path)
+			factor, err := e.pathFactor(c.Path)
 			if err != nil {
 				return StepResult{}, err
-			}
-			if !active {
-				continue
 			}
 
 			tk := e.model.Tanks[c.Target.EquipmentID]
 			if tk == nil {
 				return StepResult{}, fmt.Errorf("engine: steam_jacket target tank '%s' not found", c.Target.EquipmentID)
 			}
-			tk.SetSteamJacket(true, c.Source.TempC)
+			tk.SetSteamJacket(factor, c.Source.TempC)
 
 		case "clean_air_inlet":
-			active, err := e.isPathActive(c.Path)
+			factor, err := e.pathFactor(c.Path)
 			if err != nil {
 				return StepResult{}, err
 			}
-			if !active {
+			if factor <= 0 {
 				continue
 			}
 
@@ -143,22 +159,19 @@ func (e *Engine) Step() (StepResult, error) {
 			if tk == nil {
 				return StepResult{}, fmt.Errorf("engine: clean_air_inlet target tank '%s' not found", c.Target.EquipmentID)
 			}
-			tk.SetCleanAirInflow(c.Source.FlowNlpm)
+			tk.SetCleanAirInflow(c.Source.FlowNlpm * factor * e.flowNoise(c.ID, dt))
 
 		case "vent_outlet":
-			active, err := e.isPathActive(c.Path)
+			factor, err := e.pathFactor(c.Path)
 			if err != nil {
 				return StepResult{}, err
-			}
-			if !active {
-				continue
 			}
 
 			tk := e.model.Tanks[c.Target.EquipmentID]
 			if tk == nil {
 				return StepResult{}, fmt.Errorf("engine: vent_outlet target tank '%s' not found", c.Target.EquipmentID)
 			}
-			tk.SetVentOpen(true)
+			tk.SetVentOpen(factor)
 
 		case "agitation_link":
 			// path é opcional aqui (ligação mecânica)
@@ -189,14 +202,14 @@ func (e *Engine) Step() (StepResult, error) {
 					m.SetLoad(tk.VolumeL() > 1.0)
 				}
 			}
-			active, err := e.isPathActive(c.Path)
+			factor, err := e.pathFactor(c.Path)
 			if err != nil {
 				return StepResult{}, err
 			}
-			if !active {
+			if factor <= 0 {
 				continue
 			}
-			outflowL := (c.Source.NominalFlowLpm / 60.0) * dt
+			outflowL := (c.Source.NominalFlowLpm * factor * e.flowNoise(c.ID, dt) / 60.0) * dt
 			tk.RemoveVolume(outflowL)
 
 		default:
@@ -267,8 +280,9 @@ func (e *Engine) Step() (StepResult, error) {
 	valvesSnap := make(map[string]ValveSnapshot, len(e.model.Valves))
 	for id, v := range e.model.Valves {
 		valvesSnap[id] = ValveSnapshot{
-			Open: v.IsOpen(),
-			Flow: v.HasFlow(),
+			Open:     v.IsOpen(),
+			Flow:     v.HasFlow(),
+			Position: v.Position(),
 		}
 	}
 
@@ -297,25 +311,50 @@ func (e *Engine) Step() (StepResult, error) {
 	return res, nil
 }
 
-// isPathActive avalia se todos os equipamentos no path permitem fluxo/efeito.
+// pathFactor avalia o quanto o caminho permite de fluxo, entre 0 e 1.
 // Regra atual:
-// - Valve: precisa estar aberta
-// - Motor: precisa estar ativo (IsActive())
-func (e *Engine) isPathActive(path []string) (bool, error) {
+// - Valve: contribui com sua abertura efetiva (curso do atuador)
+// - Motor: contribui com 1 se ativo, 0 caso contrário
+// O resultado é o produto das contribuições, de modo que qualquer elemento
+// fechado ou parado zera o caminho, e uma válvula em curso produz vazão
+// parcial.
+func (e *Engine) pathFactor(path []string) (float64, error) {
+	factor := 1.0
 	for _, id := range path {
 		if v, ok := e.model.Valves[id]; ok {
-			if !v.IsOpen() {
-				return false, nil
-			}
+			factor *= v.Position()
 			continue
 		}
 		if m, ok := e.model.Motors[id]; ok {
 			if !m.IsActive() {
-				return false, nil
+				return 0, nil
 			}
 			continue
 		}
-		return false, fmt.Errorf("engine: path element '%s' not found (valve/motor)", id)
+		return 0, fmt.Errorf("engine: path element '%s' not found (valve/motor)", id)
 	}
-	return true, nil
+	if factor < 0 {
+		factor = 0
+	}
+	return factor, nil
+}
+
+// flowNoise devolve um multiplicador de vazão que varia lentamente ao redor
+// de 1, representando as pequenas oscilações de pressão a montante presentes
+// em qualquer linha real. É um passeio aleatório amortecido, o que produz
+// variação suave em vez de ruído branco ponto a ponto.
+func (e *Engine) flowNoise(connID string, dt float64) float64 {
+	if e.rng == nil {
+		return 1.0
+	}
+	n := e.noise[connID]
+	n += (-n*0.05 + (e.rng.Float64()*2-1)*0.05) * dt
+	if n > 0.07 {
+		n = 0.07
+	}
+	if n < -0.07 {
+		n = -0.07
+	}
+	e.noise[connID] = n
+	return 1.0 + n
 }

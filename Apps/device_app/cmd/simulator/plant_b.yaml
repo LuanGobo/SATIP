@@ -4,7 +4,7 @@ plant:
 
 simulation:
   dt_seconds: 1
-  duration_seconds: 20000
+  duration_seconds: 9000
 
 equipment:
   tanks:

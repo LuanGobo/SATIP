@@ -1,0 +1,12 @@
+# Dependencias e build do dashboard (Next.js)
+node_modules/
+.next/
+next-env.d.ts
+
+# Build e recarga automatica do simulador (Go / air)
+Apps/device_app/tmp/
+Apps/device_app/out/
+*.exe
+
+# Saidas locais de simulacao
+*.log
