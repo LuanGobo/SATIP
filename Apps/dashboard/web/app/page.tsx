@@ -32,13 +32,40 @@ const COLORS = [
 
 const METRIC_LABELS: Record<string, string> = {
   volume_l: "Volume (L)",
-  level_pct: "Nivel (%)",
-  temp_c: "Temperatura (C)",
-  pressure_bar: "Pressao (bar)",
-  rpm: "RPM",
+  level_pct: "Nível (%)",
+  temp_c: "Temperatura (°C)",
+  pressure_bar: "Pressão (bar)",
+  rpm: "Rotação (rpm)",
   is_open: "Aberta",
   active: "Ativo",
+  position: "Abertura (0–1)",
   value: "Valor",
+  alarm_ll: "Alarme LL",
+  alarm_l: "Alarme L",
+  alarm_h: "Alarme H",
+  alarm_hh: "Alarme HH",
+};
+
+// Rótulo da grandeza medida por cada transmissor, conforme o campo `kind`
+// gravado nos metadados do equipamento. Sem isso a legenda de um sensor
+// mostraria apenas "Valor", sem dizer se a curva é temperatura, nível ou
+// pressão — justamente o que a figura precisa deixar claro.
+const SENSOR_KIND_LABELS: Record<string, string> = {
+  temp_product: "Temperatura do produto (°C)",
+  temp_steam: "Temperatura da camisa (°C)",
+  level_pct: "Nível (%)",
+  pressure: "Pressão (bar)",
+};
+
+// Nomes das categorias na barra lateral. O agrupamento vem do tipo do
+// equipamento, que é gravado em inglês no banco.
+const CATEGORY_LABELS: Record<string, string> = {
+  tank: "Tanques",
+  valve: "Válvulas",
+  motor: "Motores",
+  sensor: "Sensores",
+  controller: "Controlador",
+  outros: "Outros",
 };
 
 // Metrics to hide from chart
@@ -235,7 +262,20 @@ export default function DashboardPage() {
   const getSeriesLabel = useCallback((key: string) => {
     const [eqId, metric] = key.split("::");
     const eq = (equipments as any[]).find(e => e.id === eqId);
-    return `${eq?.tag || eqId} - ${METRIC_LABELS[metric] || metric}`;
+
+    let rotulo = METRIC_LABELS[metric] || metric;
+
+    // Para a leitura principal de um transmissor, "Valor" nao informa a
+    // grandeza. Substitui pelo `kind` dos metadados quando disponivel;
+    // se a API nao devolver o campo, mantem o rotulo generico.
+    if (metric === "value") {
+      const kind = eq?.metadata?.kind;
+      if (kind && SENSOR_KIND_LABELS[kind]) {
+        rotulo = SENSOR_KIND_LABELS[kind];
+      }
+    }
+
+    return `${eq?.tag || eqId} - ${rotulo}`;
   }, [equipments]);
 
   const getIcon = (type) => {
@@ -268,7 +308,7 @@ export default function DashboardPage() {
             <button className="category-header" onClick={() => toggleCategory(type)}>
               <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
                 {getIcon(type)}
-                {type}s
+                {CATEGORY_LABELS[type] || `${type}s`}
               </div>
               <ChevronRight size={16} style={{ transform: collapsedCats[type] ? 'rotate(0deg)' : 'rotate(90deg)', transition: '0.2s' }} />
             </button>
